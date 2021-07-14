@@ -1,5 +1,6 @@
 """Example rq worker to handle /panorama chat commands with 1 subcommand addition."""
 import logging
+import requests
 
 from django_rq import job
 from nautobot.dcim.models import Device
@@ -7,10 +8,12 @@ from nautobot.ipam.models import Service
 from nautobot_chatops.choices import CommandStatusChoices
 from nautobot_chatops.workers import handle_subcommands, subcommand_of
 
+from panos.panorama import DeviceGroup
 from panos.firewall import Firewall
 from panos.errors import PanDeviceError
+from panos.policies import Rulebase, SecurityRule
 
-from nautobot_plugin_chatops_panorama.constant import UNKNOWN_SITE, INTERFACES
+from nautobot_plugin_chatops_panorama.constant import UNKNOWN_SITE, ALLOWED_OBJECTS, PLUGIN_CFG
 from nautobot_plugin_chatops_panorama.utils.nautobot import (
     _get_or_create_site,
     _get_or_create_device_type,
@@ -18,9 +21,33 @@ from nautobot_plugin_chatops_panorama.utils.nautobot import (
     _get_or_create_interfaces,
     _get_or_create_management_ip,
 )
-from nautobot_plugin_chatops_panorama.utils.panorama import connect_panorama, get_devices, get_rule_match
+
+from nautobot_plugin_chatops_panorama.utils.panorama import (
+    connect_panorama,
+    get_devices,
+    compare_address_objects,
+    compare_service_objects,
+    get_api_key_api,
+    get_rule_match
+)
+
 
 logger = logging.getLogger("rq.worker")
+
+
+def prompt_for_panos_device_group(dispatcher, command, connection):
+    """Prompt user for panos device group to check for groups from."""
+    group_names = [device.name for device in connection.refresh_devices()]
+    dispatcher.prompt_from_menu(command, "Select Panorama Device Group", [(grp, grp) for grp in group_names])
+    return CommandStatusChoices.STATUS_ERRORED
+
+
+def prompt_for_object_type(dispatcher, command):
+    """Prompt user for type of object to validate."""
+    dispatcher.prompt_from_menu(
+        command, "Select an allowed object type", [(object_type, object_type) for object_type in ALLOWED_OBJECTS]
+    )
+    return CommandStatusChoices.STATUS_ERRORED
 
 
 def prompt_for_nautobot_device(dispatcher, command):
@@ -140,18 +167,62 @@ def sync_firewalls(dispatcher):
 
 
 @subcommand_of("panorama")
-def validate_address_objects(dispatcher, device):
+def validate_objects(dispatcher, device, object_type, device_group):
     """Validate Address Objects exist for a device."""
     logger.info("Starting synchronization from Panorama.")
-    pano = connect_panorama()
     if not device:
-        return prompt_for_nautobot_device(dispatcher, "panorama validate-address-objects")
+        return prompt_for_nautobot_device(dispatcher, "panorama validate-objects")
+    if not object_type:
+        return prompt_for_object_type(dispatcher, f"panorama validate-objects {device}")
+
+    pano = connect_panorama()
+    if not device_group:
+        return prompt_for_panos_device_group(dispatcher, f"panorama validate-objects {device} {object_type}", pano)
+
+    pano = pano.add(DeviceGroup(name=device_group))
     device = Device.objects.get(id=device)
     services = Service.objects.filter(device=device)
     if not services:
         return dispatcher.send_markdown(f"No available services to validate against for {device}")
 
-    message = ", ".join([s.get_computed_fields()["address_object"] for s in services])
+    object_results = []
+    for s in services:
+        computed_fields = s.get_computed_fields()
+        computed_objects = computed_fields[f"{object_type}_objects"]
+        if not computed_objects:
+            continue
+
+        if object_type == "address" or object_type == "all":
+            object_results.extend(compare_address_objects(computed_objects.split(", "), pano))
+        if object_type == "service" or object_type == "all":
+            object_results.extend(compare_service_objects(computed_objects.split(", "), pano))
+
+    return dispatcher.send_large_table(("Name", "Object Type", "Status"), object_results)
+
+
+@subcommand_of("panorama")
+def get_rules(dispatcher, device, **kwargs):
+    """Get list of firewall rules by name."""
+    logger.info("Pulling list of firewall rules by name.")
+    pano = connect_panorama()
+    if not device:
+        return prompt_for_nautobot_device(dispatcher, "panorama get-rules")
+    device = Device.objects.get(id=device)
+    api_key = get_api_key_api()
+    params = {
+        "key": api_key,
+        "cmd": "<show><rule-hit-count><device-group><entry name='Demo'><pre-rulebase><entry name='security'><rules><all/></rules></entry></pre-rulebase></entry></device-group></rule-hit-count></show>",
+        "type": "op"
+    }
+    host = PLUGIN_CFG['panorama_host'].rstrip("/")
+    url = f"https://{host}/api/"
+    response = requests.get(url, params=params, verify=False)
+    if not response.ok:
+        dispatcher.send_markdown(f"Error retrieving device rules.")
+        return CommandStatusChoices.STATUS_FAILED
+    else:
+        dispatcher.send_markdown(response.text)
+        return CommandStatusChoices.STATUS_SUCCEEDED
 
     return dispatcher.send_markdown(message)
 
