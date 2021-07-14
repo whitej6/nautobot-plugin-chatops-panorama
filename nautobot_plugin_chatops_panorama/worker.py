@@ -18,8 +18,7 @@ from nautobot_plugin_chatops_panorama.utils.nautobot import (
     _get_or_create_interfaces,
     _get_or_create_management_ip,
 )
-from nautobot_plugin_chatops_panorama.utils.panorama import connect_panorama, get_devices
-
+from nautobot_plugin_chatops_panorama.utils.panorama import connect_panorama, get_devices, get_rule_match
 
 logger = logging.getLogger("rq.worker")
 
@@ -155,3 +154,19 @@ def validate_address_objects(dispatcher, device):
     message = ", ".join([s.get_computed_fields()["address_object"] for s in services])
 
     return dispatcher.send_markdown(message)
+
+
+@subcommand_of("panorama")
+def validate_rule_exists(dispatcher, device, src_ip):
+    """Verify that the rule exists within a device, via Panorama."""
+    if not device:
+        return prompt_for_nautobot_device(dispatcher, "panorama validate-rule-exists")
+    action = f"panorama validate-rule-exists {device}" # Adding single quotes around city to preserve quotes.
+    if not src_ip:
+        return dispatcher.prompt_for_text(action_id=action, help_text="Please enter the Source IP.", label="SRC-IP")
+    pano = connect_panorama()
+    data = {"src_ip":"10.0.60.100", "dst_ip": "10.0.20.100", "protocol": "6", "dst_port": "636"}
+    rule_details = get_rule_match(connection=pano, five_tuple=data)
+
+    dispatcher.send_markdown(f"The version of Panorama is {rule_details}.")
+    return CommandStatusChoices.STATUS_SUCCEEDED

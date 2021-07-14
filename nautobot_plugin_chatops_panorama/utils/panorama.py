@@ -1,3 +1,4 @@
+from typing import Protocol
 from nautobot_plugin_chatops_panorama.constant import PLUGIN_CFG
 
 from panos.panorama import Panorama
@@ -94,3 +95,34 @@ def get_devices(connection: Panorama) -> dict:
             "os_version": device_system_info["sw-version"],
         }
     return _device_dict
+
+
+def get_rule_match(connection: Panorama, five_tuple: dict) -> dict:
+    """Method to obtain the devices connected to Panorama.
+
+    Args:
+        connection (Panorama): Connection object to Panorama.
+
+    Returns:
+        dict: Dictionary of all devices attached to Panorama.
+    """
+    cmd = f"""
+        <test>
+            <security-policy-match>
+                <source>{five_tuple["src_ip"]}</source>
+                <destination>{five_tuple["dst_ip"]}</destination>
+                <protocol>{five_tuple["protocol"]}</protocol>
+                <destination-port>{five_tuple["dst_port"]}</destination-port>
+            </security-policy-match>
+        </test>"""
+    params = {
+        "key": get_api_key_api(),
+        "cmd": cmd,
+        "type": "op",
+        # TODO: no hard coding
+        "target": "007055000127282"
+    }
+
+    return requests.get(f"https://{url}/api/", params=params, verify=False).text
+
+
